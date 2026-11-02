@@ -234,439 +234,943 @@
     selectedMood=data.moods[selectedMoodDate]||'';selectedPeriod=(data.periodDays||[]).includes(selectedMoodDate);ensureDailyGame();route();renderDates();renderNames();renderTimeline();renderGallery();renderMood();renderHomeMood();renderFights();updateClock();setInterval(renderDates,60000);setInterval(updateClock,1000);setInterval(()=>{if(gameDateKey&&gameDateKey!==keyForDate(new Date()))ensureDailyGame()},60000);
   </script>
 
-  <!-- ==== 照片墙升级补丁（自动插入） ==== -->
+  <!-- ==== 私密相册（加密 + 网页内上传） ==== -->
   <script>
+/* ==========================================================================
+   小小宇宙 · 私密相册（加密 + 网页内上传）
+   --------------------------------------------------------------------------
+   读：从本站 ./secret-photos/ 读加密文件 → 用暗号解密 → 显示
+   写：压缩 → 加密 → 用 GitHub 令牌直接提交到你自己的仓库
+   仓库里只有 .bin 乱码；没有暗号谁也解不开。
+   ========================================================================== */
 (function () {
   'use strict';
 
-  var CONFIG = {
-    syncHome: true,      // 首页拼贴是否跟随相册（不想改首页就设成 false）
-    maxEdge: 1600,       // 压缩后长边像素
-    quality: 0.86,       // JPEG 质量
-    maxFiles: 60         // 最多存多少张
+  var CFG = {
+    owner: '2273873504-dotcom',
+    repo: 'our-little-universe',
+    branch: 'main',
+    dir: 'secret-photos',
+    maxEdge: 1600,
+    quality: 0.85,
+    iter: 210000,
+    api: 'https://api.github.com'
   };
 
-  var DB_NAME = 'little-universe-photos-v2';
-  var STORE = 'uploads';
-  var LEGACY_DB = 'little-universe-photos';
+  var K_TOKEN = 'ulu-gh-token';
+  var K_PASS = 'ulu-photo-pass';
 
-  var FALLBACK_FILES = ['photo-01.jpg', 'photo-02.jpg', 'photo-03.jpg', 'photo-04.jpg', 'photo-05.jpg'];
-  var FALLBACK_TITLES = ['阳光落在她脸上的时候', '她和一杯热热的东西', '小小的鬼脸收藏', '那个很快乐的晚上', '最喜欢的一个眼神'];
+  var S = {
+    key: null,          // CryptoKey
+    saltB64: '',
+    iter: CFG.iter,
+    entries: [],        // [{id, caption, addedAt}]
+    urls: [],           // 需要回收的 objectURL
+    local: {},          // 刚传上去、网站还没部署好的照片：id -> objectURL
+    busy: false
+  };
 
-  var photos = [];        // {src, caption, key}
-  var objectUrls = [];    // 需要在下次渲染前回收
-  var db = null;
-  var dbFailed = false;
-  var memoryOnly = [];    // IndexedDB 不可用时的临时存放（刷新就没了）
-
-  // 保险：先记住原版相册函数，补丁万一出错就退回它，页面不会变成空白
-  var originalRender = (typeof renderGallery === 'function') ? renderGallery : window.renderGallery;
-  var fellBack = false;
-
-  /* ---------- 小工具 ---------- */
+  /* ---------------- 基础工具 ---------------- */
 
   function say(msg) {
     if (typeof toast === 'function') { toast(msg); } else { console.log('[相册]', msg); }
   }
 
-  function defaultPhotos() {
-    var files = (typeof photoFiles !== 'undefined' && photoFiles && photoFiles.length) ? photoFiles : FALLBACK_FILES;
-    var titles = (typeof PHOTO_TITLES !== 'undefined' && PHOTO_TITLES && PHOTO_TITLES.length) ? PHOTO_TITLES : FALLBACK_TITLES;
-    return files.map(function (f, i) {
-      return { src: './assets/' + f, caption: titles[i] || '她的照片', key: null };
-    });
+  function fail(msg) {
+    console.error('[相册]', msg);
+    say(msg);
   }
 
-  function revokeUrls() {
-    objectUrls.forEach(function (u) { try { URL.revokeObjectURL(u); } catch (e) {} });
-    objectUrls = [];
-  }
-
-  /* ---------- 数据库 ---------- */
-
-  function openDb() {
-    if (db) { return Promise.resolve(db); }
-    if (dbFailed || !('indexedDB' in window)) { return Promise.resolve(null); }
-    return new Promise(function (resolve) {
-      var req;
-      try {
-        req = indexedDB.open(DB_NAME, 1);
-      } catch (e) {
-        dbFailed = true;
-        return resolve(null);
-      }
-      req.onupgradeneeded = function () {
-        var d = req.result;
-        if (!d.objectStoreNames.contains(STORE)) { d.createObjectStore(STORE); }
-      };
-      req.onsuccess = function () { db = req.result; resolve(db); };
-      req.onerror = function () {
-        dbFailed = true;
-        resolve(null);
-      };
-      req.onblocked = function () { resolve(null); };
-    });
-  }
-
-  // 读出全部上传（按加入时间从早到晚）
-  function loadUploads() {
-    return openDb().then(function (d) {
-      if (!d) { return memoryOnly.slice(); }
-      return new Promise(function (resolve) {
-        var out = [];
-        try {
-          var req = d.transaction(STORE, 'readonly').objectStore(STORE).openCursor();
-          req.onsuccess = function () {
-            var c = req.result;
-            if (c) {
-              if (c.value && c.value.blob) {
-                out.push({ key: c.key, addedAt: c.value.addedAt || 0, blob: c.value.blob });
-              }
-              c.continue();
-            } else {
-              out.sort(function (a, b) { return a.addedAt - b.addedAt; });
-              resolve(out);
-            }
-          };
-          req.onerror = function () { resolve(out); };
-        } catch (e) {
-          resolve(out);
-        }
-      });
-    });
-  }
-
-  // 写入并回读验证：成功 true，失败 false（不再静默）
-  function saveUpload(blob, addedAt) {
-    if (dbFailed) { return Promise.resolve(false); }
-    return openDb().then(function (d) {
-      if (!d) {
-        memoryOnly.push({ key: 'mem' + addedAt, addedAt: addedAt, blob: blob });
-        return true;
-      }
-      var key = 'p' + addedAt + '-' + Math.random().toString(36).slice(2, 7);
-      return new Promise(function (resolve) {
-        var ok = false;
-        var tx;
-        try {
-          tx = d.transaction(STORE, 'readwrite');
-          tx.objectStore(STORE).put({ blob: blob, addedAt: addedAt }, key);
-        } catch (e) {
-          if (e && e.name === 'QuotaExceededError') { say('浏览器本地空间满了，先删几张再试～'); }
-          return resolve(false);
-        }
-        tx.oncomplete = function () {
-          // 回读一次，确认真的写进去了
-          var check = d.transaction(STORE, 'readonly').objectStore(STORE).get(key);
-          check.onsuccess = function () { resolve(!!check.result); };
-          check.onerror = function () { resolve(false); };
-        };
-        tx.onerror = function (e) {
-          var name = (e && e.target && e.target.error && e.target.error.name) || '';
-          if (name === 'QuotaExceededError') { say('浏览器本地空间满了，先删几张再试～'); }
-          resolve(false);
-        };
-        tx.onabort = function () { resolve(false); };
-      });
-    });
-  }
-
-  function deleteUpload(key) {
-    if (!key) { return Promise.resolve(); }
-    if (key.indexOf('mem') === 0) {
-      memoryOnly = memoryOnly.filter(function (r) { return r.key !== key; });
-      return Promise.resolve();
+  function bytesToB64(u8) {
+    var out = '', chunk = 0x8000;
+    for (var i = 0; i < u8.length; i += chunk) {
+      out += String.fromCharCode.apply(null, u8.subarray(i, i + chunk));
     }
-    return openDb().then(function (d) {
-      if (!d) { return; }
-      return new Promise(function (resolve) {
-        var tx = d.transaction(STORE, 'readwrite');
-        tx.objectStore(STORE).delete(key);
-        tx.oncomplete = resolve;
-        tx.onerror = resolve;
+    return btoa(out);
+  }
+
+  function b64ToBytes(s) {
+    var bin = atob(s), u8 = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) { u8[i] = bin.charCodeAt(i); }
+    return u8;
+  }
+
+  function randBytes(n) {
+    var u8 = new Uint8Array(n);
+    crypto.getRandomValues(u8);
+    return u8;
+  }
+
+  /* ---------------- 加密 ---------------- */
+
+  function deriveKey(pass, saltB64, iter) {
+    return crypto.subtle.importKey('raw', new TextEncoder().encode(pass), 'PBKDF2', false, ['deriveKey'])
+      .then(function (base) {
+        return crypto.subtle.deriveKey(
+          { name: 'PBKDF2', salt: b64ToBytes(saltB64), iterations: iter || CFG.iter, hash: 'SHA-256' },
+          base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']
+        );
+      });
+  }
+
+  // 文件格式：[12 字节 iv][密文 + 16 字节校验]
+  function encryptBytes(u8) {
+    var iv = randBytes(12);
+    return crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, S.key, u8).then(function (ct) {
+      var buf = new Uint8Array(12 + ct.byteLength);
+      buf.set(iv, 0);
+      buf.set(new Uint8Array(ct), 12);
+      return buf;
+    });
+  }
+
+  function decryptBytes(u8) {
+    var iv = u8.subarray(0, 12);
+    var ct = u8.subarray(12);
+    return crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv }, S.key, ct).then(function (pt) {
+      return new Uint8Array(pt);
+    });
+  }
+
+  /* ---------------- GitHub 读写 ---------------- */
+
+  function token() { try { return localStorage.getItem(K_TOKEN) || ''; } catch (e) { return ''; } }
+
+  function ghHeaders() {
+    return {
+      'Authorization': 'Bearer ' + token(),
+      'Accept': 'application/vnd.github+json',
+      'Content-Type': 'application/json',
+      'X-GitHub-Api-Version': '2022-11-28'
+    };
+  }
+
+  function apiUrl(path) {
+    return CFG.api + '/repos/' + CFG.owner + '/' + CFG.repo + '/contents/' + path.split('/').join('/');
+  }
+
+  // 返回 {sha, bytes} 或 null（文件不存在）
+  function apiGet(path) {
+    return fetch(apiUrl(path) + '?ref=' + CFG.branch + '&t=' + Date.now(),
+      { headers: ghHeaders(), cache: 'no-store' })
+      .then(function (r) {
+        if (r.status === 404) { return null; }
+        if (!r.ok) { throw new Error('GitHub 读取失败 ' + r.status); }
+        return r.json();
+      })
+      .then(function (j) {
+        if (!j) { return null; }
+        return { sha: j.sha, bytes: b64ToBytes((j.content || '').replace(/\s/g, '')) };
+      });
+  }
+
+  function apiPut(path, bytes, message, sha) {
+    var body = { message: message, content: bytesToB64(bytes), branch: CFG.branch };
+    if (sha) { body.sha = sha; }
+    return fetch(apiUrl(path), { method: 'PUT', headers: ghHeaders(), body: JSON.stringify(body) })
+      .then(function (r) {
+        if (r.ok) { return r.json(); }
+        if (r.status === 401 || r.status === 403) { throw new Error('钥匙没权限或已过期（重新生成一个再粘进来）'); }
+        if (r.status === 409 || r.status === 422) { throw new Error('仓库刚被改过，刷新页面再试一次'); }
+        return r.text().then(function (t) { throw new Error('提交失败 ' + r.status + ' ' + t.slice(0, 80)); });
+      });
+  }
+
+  // 直接从网站自身读（同源、不需要令牌）
+  function pageFetch(name) {
+    return fetch('./' + CFG.dir + '/' + name + '?t=' + Date.now(), { cache: 'no-store' })
+      .then(function (r) { return r.ok ? r.arrayBuffer() : null; })
+      .catch(function () { return null; });
+  }
+
+  /* ---------------- 头部（盐）与清单 ---------------- */
+
+  function readHead() {
+    return pageFetch('head.json').then(function (buf) {
+      if (!buf) { return null; }
+      try {
+        var j = JSON.parse(new TextDecoder().decode(new Uint8Array(buf)));
+        return (j && j.salt) ? j : null;
+      } catch (e) { return null; }
+    });
+  }
+
+  function createHead(pass) {
+    // 先问 API 有没有：刚创建但网站还没部署的那一分钟里，别重复建
+    return apiGet(CFG.dir + '/head.json').then(function (f) {
+      if (f) {
+        var j = JSON.parse(new TextDecoder().decode(f.bytes));
+        S.saltB64 = j.salt;
+        S.iter = j.iter || CFG.iter;
+        return deriveKey(pass, S.saltB64, S.iter);
+      }
+      var saltB64 = bytesToB64(randBytes(16));
+      var json = new TextEncoder().encode(JSON.stringify({ v: 1, iter: CFG.iter, salt: saltB64 }));
+      return apiPut(CFG.dir + '/head.json', json, '创建相册暗号', null).then(function () {
+        S.saltB64 = saltB64;
+        S.iter = CFG.iter;
+        return deriveKey(pass, saltB64, CFG.iter);
       });
     });
   }
 
-  /* ---------- 把旧版 extra0..extra4 搬过来 ---------- */
+  // 解清单；解不开说明暗号不对
+  function decodeIndex(bytes) {
+    if (!bytes) { return Promise.resolve({ ok: true, items: [] }); }
+    return decryptBytes(bytes).then(function (pt) {
+      try {
+        var j = JSON.parse(new TextDecoder().decode(pt));
+        return { ok: true, items: (j && j.items) || [] };
+      } catch (e) { return { ok: false, items: [] }; }
+    }).catch(function () { return { ok: false, items: [] }; });
+  }
 
-  function migrateLegacy() {
-    if (!('indexedDB' in window) || !indexedDB.databases) { return Promise.resolve(0); }
-    return indexedDB.databases().then(function (list) {
-      var exists = list.some(function (d) { return d.name === LEGACY_DB; });
-      if (!exists) { return 0; }
-      return new Promise(function (resolve) {
-        var req = indexedDB.open(LEGACY_DB, 1);
-        req.onupgradeneeded = function () {};
-        req.onerror = function () { resolve(0); };
-        req.onsuccess = function () {
-          var oldDb = req.result;
-          if (!oldDb.objectStoreNames.contains('photos')) { oldDb.close(); return resolve(0); }
-          var keys = ['extra0', 'extra1', 'extra2', 'extra3', 'extra4'];
-          var moved = 0;
-          var chain = Promise.resolve();
-          keys.forEach(function (k) {
-            chain = chain.then(function () {
-              return new Promise(function (res) {
-                var g = oldDb.transaction('photos', 'readonly').objectStore('photos').get(k);
-                g.onsuccess = function () {
-                  var val = g.result;
-                  if (!val) { return res(); }
-                  res(saveUpload(val, Date.now()).then(function (ok) { if (ok) { moved++; } }));
-                };
-                g.onerror = function () { res(); };
-              });
-            });
-          });
-          chain.then(function () { oldDb.close(); resolve(moved); });
-        };
+  function readIndexApi() {
+    return apiGet(CFG.dir + '/index.bin').then(function (f) {
+      if (!f) { return { ok: true, items: [], sha: null }; }
+      return decodeIndex(f.bytes).then(function (r) {
+        r.sha = f.sha;
+        return r;
       });
     });
   }
 
-  /* ---------- 图片处理 ---------- */
+  function readIndexPage() {
+    return pageFetch('index.bin').then(function (buf) {
+      return decodeIndex(buf ? new Uint8Array(buf) : null);
+    });
+  }
 
-  // 统一转成压缩后的 JPEG；认不出的格式直接抛错（好给用户一句人话）
-  function toJpegBlob(file) {
+  function writeIndexApi(items, sha) {
+    var json = new TextEncoder().encode(JSON.stringify({ v: 1, items: items }));
+    return encryptBytes(json).then(function (enc) {
+      return apiPut(CFG.dir + '/index.bin', enc, '更新相册清单', sha || null);
+    });
+  }
+
+  /* ---------------- 图片压缩 ---------------- */
+
+  function compress(file) {
     var draw = function (bitmap) {
-      var w = bitmap.width, h = bitmap.height;
-      var scale = Math.min(1, CONFIG.maxEdge / Math.max(w, h));
-      var cw = Math.max(1, Math.round(w * scale));
-      var ch = Math.max(1, Math.round(h * scale));
+      var scale = Math.min(1, CFG.maxEdge / Math.max(bitmap.width || bitmap.naturalWidth, bitmap.height || bitmap.naturalHeight));
+      var w = bitmap.width || bitmap.naturalWidth;
+      var h = bitmap.height || bitmap.naturalHeight;
       var canvas = document.createElement('canvas');
-      canvas.width = cw;
-      canvas.height = ch;
+      canvas.width = Math.max(1, Math.round(w * scale));
+      canvas.height = Math.max(1, Math.round(h * scale));
       var ctx = canvas.getContext('2d');
-      ctx.fillStyle = '#ffffff';
-      ctx.fillRect(0, 0, cw, ch);
-      ctx.drawImage(bitmap, 0, 0, cw, ch);
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
       if (bitmap.close) { bitmap.close(); }
       return new Promise(function (res, rej) {
-        canvas.toBlob(function (b) { b ? res(b) : rej(new Error('canvas 导出失败')); }, 'image/jpeg', CONFIG.quality);
+        canvas.toBlob(function (b) {
+          if (!b) { return rej(new Error('图片处理失败')); }
+          b.arrayBuffer().then(function (ab) { res(new Uint8Array(ab)); });
+        }, 'image/jpeg', CFG.quality);
       });
     };
-
     if (window.createImageBitmap) {
       return createImageBitmap(file, { imageOrientation: 'from-image' }).then(draw, function () {
         return createImageBitmap(file).then(draw);
       });
     }
-    // 老浏览器兜底
     return new Promise(function (res, rej) {
-      var url = URL.createObjectURL(file);
-      var img = new Image();
-      img.onload = function () {
-        var canvas = document.createElement('canvas');
-        var scale = Math.min(1, CONFIG.maxEdge / Math.max(img.naturalWidth, img.naturalHeight));
-        canvas.width = Math.round(img.naturalWidth * scale);
-        canvas.height = Math.round(img.naturalHeight * scale);
-        canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
-        canvas.toBlob(function (b) { URL.revokeObjectURL(url); b ? res(b) : rej(new Error('canvas 导出失败')); }, 'image/jpeg', CONFIG.quality);
-      };
-      img.onerror = function () { URL.revokeObjectURL(url); rej(new Error('浏览器打不开这个图片格式')); };
+      var url = URL.createObjectURL(file), img = new Image();
+      img.onload = function () { URL.revokeObjectURL(url); draw(img).then(res, rej); };
+      img.onerror = function () { URL.revokeObjectURL(url); rej(new Error('这个格式浏览器打不开，先在手机里导成 JPG')); };
       img.src = url;
     });
   }
 
-  /* ---------- 渲染 ---------- */
+  /* ---------------- 界面 ---------------- */
 
-  function ensureStyle() {
-    if (document.getElementById('uluGalleryStyle')) { return; }
+  function mount() {
+    var page = document.querySelector('[data-view="gallery"]');
+    if (!page) { return null; }
+    var oldGrid = document.querySelector('#galleryGrid');
+    if (oldGrid) { oldGrid.style.display = 'none'; }
+    var oldLabel = page.querySelector('.gallery-label');
+    if (oldLabel) { oldLabel.style.display = 'none'; }
+    var host = document.getElementById('uluVault');
+    if (!host) {
+      host = document.createElement('div');
+      host.id = 'uluVault';
+      page.appendChild(host);
+    }
+    return host;
+  }
+
+  function style() {
+    if (document.getElementById('uluVaultStyle')) { return; }
     var s = document.createElement('style');
-    s.id = 'uluGalleryStyle';
+    s.id = 'uluVaultStyle';
     s.textContent = [
-      '.ulu-del{position:absolute;right:-9px;top:-9px;width:26px;height:26px;border-radius:50%;border:2px solid #fff;',
-      'background:#e88a9b;color:#fff;font-size:13px;line-height:1;cursor:pointer;box-shadow:0 3px 8px rgba(120,70,90,.28);z-index:3}',
-      '.gallery-tile{overflow:visible}',
-      '.ulu-status{margin:26px 0 0;padding:10px 14px;border:1px dashed #e8cbd3;border-radius:14px;background:rgba(255,255,255,.6);',
-      'color:#a4808f;font-size:11px;text-align:center}',
-      '.ulu-status b{color:#d4748a}'
+      '#uluVault{margin-top:8px}',
+      '.ulu-door{max-width:560px;margin:26px auto;padding:30px 26px;border-radius:26px;text-align:center;',
+      'background:linear-gradient(145deg,#eeeaff,#fff1f2);border:1px solid #e4d8ee;box-shadow:0 10px 0 #eee7ef}',
+      '.ulu-door h2{font:26px var(--serif);margin:6px 0 8px;color:#64507e}',
+      '.ulu-door p{font-size:12px;color:#95869c;max-width:400px;margin:0 auto 16px}',
+      '.ulu-door input{width:min(300px,100%);padding:11px 13px;border:1px solid #e2d3e6;border-radius:12px;',
+      'background:#fffdfb;color:#52394b;text-align:center;letter-spacing:.14em;outline:none}',
+      '.ulu-door input:focus{border-color:#b9a6e0;box-shadow:0 0 0 3px #efe7ff}',
+      '.ulu-door .row{display:flex;gap:9px;justify-content:center;flex-wrap:wrap;margin-top:14px}',
+      '.ulu-note{font-size:10px;color:#ab90a0;margin-top:14px;line-height:1.8}',
+      '.ulu-gate{margin-top:22px;padding:14px 16px;border:1px dashed #e8cbd3;border-radius:16px;',
+      'background:rgba(255,255,255,.6);font-size:11px;color:#a4808f;line-height:1.9}',
+      '.ulu-gate input{width:100%;margin-top:8px;padding:9px 11px;border:1px solid #e6d2d8;border-radius:10px;',
+      'background:#fffdfb;outline:none}',
+      '.ulu-status{margin:22px 0 0;padding:10px 14px;border:1px dashed #e8cbd3;border-radius:14px;',
+      'background:rgba(255,255,255,.6);color:#a4808f;font-size:11px;text-align:center}',
+      '.ulu-status b{color:#d4748a}',
+      '.gallery-tile{overflow:visible}'
     ].join('');
     document.head.appendChild(s);
   }
 
-  function tile(item, index, badge) {
-    var fig = document.createElement('figure');
-    fig.className = 'gallery-tile';
-    var img = document.createElement('img');
-    img.src = item.src;
-    img.alt = item.caption || '她的照片';
-    img.loading = 'lazy';
-    var cap = document.createElement('figcaption');
-    cap.textContent = item.caption || '她的照片';
-    fig.appendChild(img);
-    fig.appendChild(cap);
-    if (item.key) {
-      var del = document.createElement('button');
-      del.className = 'ulu-del';
-      del.type = 'button';
-      del.textContent = '×';
-      del.title = '删掉这张（只删本机）';
-      del.onclick = function (ev) {
-        ev.stopPropagation();
-        if (!window.confirm('这张照片会从这台设备上删掉，确定吗？')) { return; }
-        deleteUpload(item.key).then(function () { return render(); });
-      };
-      fig.appendChild(del);
-    }
-    fig.onclick = function () { show(index); };
-    if (badge) {
-      var tag = document.createElement('span');
-      tag.className = 'pill';
-      tag.style.cssText = 'position:absolute;left:8px;bottom:8px;background:#fff5f6;font-size:9px';
-      tag.textContent = badge;
-      fig.appendChild(tag);
-    }
-    return fig;
+  function tokenGate(onSaved) {
+    var gate = document.createElement('div');
+    gate.className = 'ulu-gate';
+    gate.innerHTML =
+      '<b>先放“上传钥匙”（只有你的设备需要）</b><br>' +
+      '一串 <code>github_pat_…</code>，只存在这台浏览器里，不会写进网页。她要的只是暗号。' +
+      '<input id="uluToken" type="password" placeholder="粘贴 github_pat_...">' +
+      '<div style="display:flex;gap:8px;margin-top:8px">' +
+      '<button class="button soft small" id="uluSaveToken">保存钥匙</button></div>';
+    var tk = gate.querySelector('#uluToken');
+    if (token()) { tk.placeholder = '已保存钥匙（要换就在这儿粘新的）'; }
+    gate.querySelector('#uluSaveToken').onclick = function () {
+      var v = tk.value.trim();
+      if (!v) { say('还没填内容哦～'); return; }
+      if (!/^(github_pat_|ghp_)/.test(v)) { say('这看起来不像 GitHub 令牌'); return; }
+      try { localStorage.setItem(K_TOKEN, v); } catch (e) {}
+      say('钥匙存好啦');
+      if (onSaved) { onSaved(); }
+    };
+    return gate;
   }
 
-  function renderCore() {
-    ensureStyle();
-    var grid = document.querySelector('#galleryGrid');
-    if (!grid) { return Promise.resolve(); }
+  function paintLock(host) {
+    host.innerHTML = '';
+    var box = document.createElement('div');
+    box.className = 'ulu-door';
+    box.innerHTML =
+      '<h2>这间相册要暗号</h2>' +
+      '<p>照片在仓库里是加密的，只有输对暗号才会解开。你们两个人用同一个暗号。</p>' +
+      '<input id="uluPass" type="password" placeholder="输入你们的暗号" autocomplete="off">' +
+      '<div class="row"><button class="button lilac" id="uluUnlock">解开相册　♡</button></div>' +
+      '<p class="ulu-note" id="uluLockMsg">暗号只在你的浏览器里用来解密，不会上传到任何地方。</p>';
+    host.appendChild(box);
 
-    return loadUploads().then(function (uploads) {
-      revokeUrls();
-      photos = defaultPhotos();
-      uploads.forEach(function (u) {
-        var url = URL.createObjectURL(u.blob);
-        objectUrls.push(url);
-        photos.push({ src: url, caption: '新放进来的回忆', key: u.key });
+    var input = box.querySelector('#uluPass');
+    var msg = box.querySelector('#uluLockMsg');
+    box.querySelector('#uluUnlock').onclick = function () {
+      var pass = input.value.trim();
+      if (pass.length < 4) { msg.textContent = '暗号至少 4 位哦～'; return; }
+      msg.textContent = '正在解开…';
+      unlock(pass).then(function (ok) {
+        if (ok) { renderGallery(host); }
+        else { msg.textContent = '暗号不对，或者相册还没创建。'; }
       });
-      if (photos.length > CONFIG.maxFiles + 5) {
-        say('相册里的照片有点多啦，删掉几张老的再放新的吧～');
-      }
+    };
+    input.onkeydown = function (e) { if (e.key === 'Enter') { box.querySelector('#uluUnlock').click(); } };
+    input.focus();
 
-      grid.innerHTML = '';
-      photos.forEach(function (item, i) { grid.appendChild(tile(item, i, null)); });
-
-      // 上传入口
-      var upload = document.createElement('label');
-      upload.className = 'upload-tile';
-      upload.innerHTML = '<b>＋</b><span>放进一张新的回忆</span><small>可以一次选多张 · 存在本机</small>' +
-                         '<input type="file" accept="image/*" multiple>';
-      upload.querySelector('input').onchange = function (e) {
-        handleFiles(e.target.files);
-      };
-      grid.appendChild(upload);
-
-      // 状态行
-      var status = document.querySelector('.ulu-status');
-      if (!status) {
-        status = document.createElement('div');
-        status.className = 'ulu-status';
-        grid.parentNode.insertBefore(status, grid.nextSibling);
-      }
-      var mine = photos.filter(function (p) { return p.key; }).length;
-      if (dbFailed) {
-        status.innerHTML = '<b>这台浏览器不允许本地保存</b>，现在加的照片刷新就没了（无痕模式、部分 App 内置浏览器会这样）。换成 Chrome / Safari 正常窗口打开再试。';
-      } else {
-        status.innerHTML = '这里共 <b>' + photos.length + '</b> 张，其中你自己放进来的是 <b>' + mine + '</b> 张。' +
-                           '上传的照片只保存在<b>这台设备的这个浏览器</b>里，不会同步给别人，也不会丢到网上去。';
-      }
-
-      if (CONFIG.syncHome) { syncHome(); }
-    });
+    if (!token()) {
+      host.appendChild(tokenGate(function () {
+        msg.textContent = '钥匙放好了。现在输入你们的暗号，第一次输入就会用这个暗号建相册。';
+        input.focus();
+      }));
+    }
   }
 
-  // 统一入口：任何意外都在这里兜住
-  function render() {
-    return Promise.resolve().then(renderCore).catch(function (err) {
-      console.error('[相册补丁]', err);
-      if (!fellBack && typeof originalRender === 'function') {
-        fellBack = true;
-        try { originalRender(); } catch (e) {}
-        say('相册补丁出了点问题，已经退回原版显示');
-      }
-    });
-  }
+  function remember(pass) { try { localStorage.setItem(K_PASS, pass); } catch (e) {} }
 
-  function handleFiles(fileList) {
-    var files = Array.prototype.slice.call(fileList || []);
-    if (!files.length) { return; }
-    var done = 0, failed = [];
-
-    // 一张一张串行处理，避免手机内存爆掉
-    var chain = Promise.resolve();
-    files.forEach(function (f) {
-      chain = chain.then(function () {
-        if (!/^image\//.test(f.type) && !/\.(jpe?g|png|webp|gif|bmp|avif|heic)$/i.test(f.name)) {
-          failed.push(f.name + '（不是图片）');
-          return;
-        }
-        return toJpegBlob(f).then(function (blob) {
-          return saveUpload(blob, Date.now()).then(function (ok) {
-            if (ok) { done++; } else { failed.push(f.name + '（写入失败）'); }
+  function unlock(pass) {
+    return readHead().then(function (head) {
+      if (head) {
+        S.saltB64 = head.salt;
+        S.iter = head.iter || CFG.iter;
+        return deriveKey(pass, S.saltB64, S.iter).then(function (k) {
+          S.key = k;
+          // 有钥匙就走 API（数据最新），没有就走网站（够用）
+          return (token() ? readIndexApi() : readIndexPage()).then(function (r) {
+            if (!r.ok) { return false; }        // 清单解不开 = 暗号不对
+            S.entries = r.items;
+            remember(pass);
+            return true;
           });
-        }, function (err) {
-          failed.push(f.name + '（' + (err && err.message === '浏览器打不开这个图片格式'
-            ? '格式打不开，可能是 iPhone 的 HEIC，先导出成 JPG'
-            : (err && err.message) || '处理失败') + '）');
+        });
+      }
+      // 还没有相册：只有带钥匙的人能创建
+      if (!token()) { return false; }
+      return createHead(pass).then(function (k) {
+        S.key = k;
+        return readIndexApi().then(function (r) {
+          if (!r.ok) { return false; }          // 暗号和这个相册原有的不一样
+          S.entries = r.items;
+          remember(pass);
+          return true;
         });
       });
-    });
-
-    return chain.then(function () {
-      return render();
-    }).then(function () {
-      if (done && !failed.length) { say('加进去啦，' + done + ' 张　♡'); }
-      else if (done && failed.length) { say('成功 ' + done + ' 张，' + failed.length + ' 张没成功：' + failed[0]); }
-      else if (failed.length) { say('没能加进去：' + failed[0]); }
-    });
+    }).catch(function (e) { console.error(e); return false; });
   }
 
-  /* ---------- 放大预览 ---------- */
+  function renderGallery(host) {
+    host = host || mount();
+    if (!host) { return; }
+    style();
+    revokeUrls();
+    host.innerHTML = '';
 
-  function show(index) {
-    if (!photos.length) { return; }
-    var n = photos.length;
-    activePhoto = ((index % n) + n) % n;
-    var item = photos[activePhoto];
-    document.querySelector('#viewerImage').src = item.src;
-    document.querySelector('#viewerCaption').textContent = item.caption || '她的照片';
-    // 原版弹窗
+    var head = document.createElement('div');
+    head.className = 'gallery-label';
+    head.innerHTML = '<div><strong style="font:22px var(--serif)">只有我们两个人</strong>' +
+      '<p>加密照片 · 点开看大图 · 新照片直接在这里加</p></div><span class="pill">🔒 已解锁</span>';
+    host.appendChild(head);
+
+    var grid = document.createElement('div');
+    grid.className = 'gallery-grid';
+    host.appendChild(grid);
+
+    if (!S.entries.length) {
+      var empty = document.createElement('div');
+      empty.className = 'empty-note';
+      empty.style.gridColumn = '1 / -1';
+      empty.textContent = '相册还空着。点下面的 ＋ 放进第一张吧　✿';
+      grid.appendChild(empty);
+    }
+
+    S.entries.slice()
+      .sort(function (a, b) { return (b.addedAt || 0) - (a.addedAt || 0); })
+      .forEach(function (item) {
+        var fig = document.createElement('figure');
+        fig.className = 'gallery-tile';
+        var img = document.createElement('img');
+        img.alt = '我们的照片';
+        img.loading = 'lazy';
+        var cap = document.createElement('figcaption');
+        cap.textContent = item.caption || '我们的照片';
+        fig.appendChild(img);
+        fig.appendChild(cap);
+        grid.appendChild(fig);
+        loadPhoto(item, img);
+        fig.onclick = function () { if (img.src) { openViewer(item, img.src); } };
+      });
+
+    var tile = document.createElement('label');
+    tile.className = 'upload-tile';
+    tile.innerHTML = '<b>＋</b><span>放进一张新的回忆</span>' +
+                     '<small>加密后直接存进仓库 · 两个人都能看到</small>' +
+                     '<input type="file" accept="image/*" multiple>';
+    tile.querySelector('input').onchange = function (e) { addFiles(e.target.files); };
+    grid.appendChild(tile);
+
+    var status = document.createElement('div');
+    status.className = 'ulu-status';
+    if (!token()) {
+      status.innerHTML = '这台设备<b>只能看，不能加</b>。要在网页里加照片，把“上传钥匙”粘到下面保存一次就行（她不需要）。';
+    } else {
+      status.innerHTML = '共 <b>' + S.entries.length + '</b> 张加密照片。加完后 GitHub 约 <b>1 分钟</b>更新，到时刷新即可。';
+    }
+    host.appendChild(status);
+
+    var gate = document.createElement('div');
+    gate.className = 'ulu-gate';
+    gate.innerHTML =
+      '<b>上传钥匙（只有你的设备需要）</b><br>' +
+      '一串 <code>github_pat_…</code>，只存在这台浏览器，不会写进网页里。' +
+      '<input id="uluToken" type="password" placeholder="粘贴 github_pat_...">' +
+      '<div style="display:flex;gap:8px;margin-top:8px">' +
+      '<button class="button soft small" id="uluSaveToken">保存钥匙</button>' +
+      '<button class="button soft small" id="uluLock">锁上相册</button></div>';
+    host.appendChild(gate);
+
+    var tk = gate.querySelector('#uluToken');
+    if (token()) { tk.placeholder = '已保存钥匙（要换就在这里粘新的）'; }
+    gate.querySelector('#uluSaveToken').onclick = function () {
+      var v = tk.value.trim();
+      if (!v) { say('还没填内容哦～'); return; }
+      if (!/^(github_pat_|ghp_|github_pat)/.test(v)) { say('这看起来不像 GitHub 令牌'); return; }
+      try { localStorage.setItem(K_TOKEN, v); } catch (e) {}
+      say('钥匙存好了，现在可以加照片啦');
+      renderGallery(host);
+    };
+    gate.querySelector('#uluLock').onclick = function () {
+      S.key = null; S.entries = []; S.local = {}; revokeUrls();
+      try { localStorage.removeItem(K_PASS); } catch (e) {}
+      paintLock(host);
+    };
+  }
+
+  function loadPhoto(item, img) {
+    if (S.local[item.id]) { img.src = S.local[item.id]; return Promise.resolve(); }
+    return pageFetch(item.id + '.bin').then(function (buf) {
+      if (!buf) { img.alt = '（这张还没部署好，等一分钟刷新）'; return null; }
+      return decryptBytes(new Uint8Array(buf)).then(function (pt) {
+        var url = URL.createObjectURL(new Blob([pt], { type: 'image/jpeg' }));
+        S.urls.push(url);
+        img.src = url;
+        return url;
+      });
+    }).catch(function (e) { img.alt = '（解开失败）'; console.error(e); });
+  }
+
+  function revokeUrls() {
+    S.urls.forEach(function (u) { try { URL.revokeObjectURL(u); } catch (e) {} });
+    S.urls = [];
+  }
+
+  function openViewer(item, src) {
+    var img = document.querySelector('#viewerImage');
+    var cap = document.querySelector('#viewerCaption');
+    if (!img) { return; }
+    img.src = src || '';
+    if (cap) { cap.textContent = item.caption || '我们的照片'; }
     if (typeof openModal === 'function') { openModal('viewerModal'); }
     else { document.querySelector('#viewerModal').classList.add('open'); }
   }
 
-  /* ---------- 首页拼贴跟随 ---------- */
+  /* ---------------- 上传 ---------------- */
 
-  function syncHome() {
-    var pool = photos.slice().reverse();   // 新的优先
-    if (!pool.length) { return; }
-    var stage = document.querySelectorAll('.photo-stage .photo-card img');
-    for (var i = 0; i < stage.length; i++) {
-      stage[i].src = pool[i % pool.length].src;
+  function addFiles(fileList) {
+    var files = Array.prototype.slice.call(fileList || []);
+    if (!files.length) { return; }
+    if (!token()) { fail('这台设备没有上传钥匙，先在下面粘一次'); return; }
+    if (S.busy) { say('上一张还在传，稍等一下～'); return; }
+    S.busy = true;
+
+    var n = 0;
+    var chain = Promise.resolve();
+    files.forEach(function (f) {
+      chain = chain.then(function () { return addOne(f).then(function () { n++; }); });
+    });
+
+    chain.then(function () {
+      S.busy = false;
+      renderGallery();
+      if (n) { say('传上去 ' + n + ' 张　♡ 约 1 分钟后刷新就能看到'); }
+    }).catch(function (e) {
+      S.busy = false;
+      fail((e && e.message) || '上传失败');
+      renderGallery();
+    });
+  }
+
+  function addOne(file) {
+    say('正在处理 ' + file.name + ' …');
+    var id = 'p' + Date.now() + '-' + Math.random().toString(36).slice(2, 7);
+    var blobUrl = null;
+
+    return compress(file).then(function (u8) {
+      // 本地先留一份，刚传完就能立刻看到（不用等 GitHub 部署）
+      blobUrl = URL.createObjectURL(new Blob([u8], { type: 'image/jpeg' }));
+      return encryptBytes(u8);
+    }).then(function (enc) {
+      return apiPut(CFG.dir + '/' + id + '.bin', enc, '加入一张照片', null);
+    }).then(function () {
+      // 用 API 读最新清单（权威），避免读到还没部署的旧站文件
+      return readIndexApi().then(function (r) {
+        if (!r.ok) { throw new Error('清单解不开（暗号可能对不上）'); }
+        r.items.push({ id: id, caption: '我们的照片', addedAt: Date.now() });
+        return writeIndexApi(r.items, r.sha).then(function () {
+          S.entries = r.items;
+          S.local[id] = blobUrl;
+        });
+      });
+    });
+  }
+
+  /* ---------------- 启动 ---------------- */
+
+  function boot() {
+    if (!document.querySelector('[data-view="gallery"]')) { return; }
+    var host = mount();
+    if (!host) { return; }
+    style();
+
+    var saved = '';
+    try { saved = localStorage.getItem(K_PASS) || ''; } catch (e) {}
+    if (saved) {
+      host.innerHTML = '<div class="ulu-status">正在用记住的暗号打开相册…</div>';
+      unlock(saved).then(function (ok) {
+        if (ok) { renderGallery(host); } else { paintLock(host); }
+      });
+    } else {
+      paintLock(host);
     }
-    var atmo = document.querySelectorAll('.photo-atmosphere img');
-    for (var j = 0; j < atmo.length; j++) {
-      atmo[j].src = pool[j % pool.length].src;
+
+    window.addEventListener('hashchange', function () {
+      setTimeout(function () {
+        var h = document.getElementById('uluVault');
+        if (h && S.key && !h.querySelector('.gallery-grid')) { renderGallery(h); }
+      }, 60);
+    });
+  }
+
+  // 给自动化测试留的钩子（不影响正常使用）
+  window.__uluVault = {
+    deriveKey: deriveKey,
+    encryptBytes: encryptBytes,
+    decryptBytes: decryptBytes,
+    setKey: function (k) { S.key = k; },
+    bytesToB64: bytesToB64,
+    b64ToBytes: b64ToBytes
+  };
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', boot);
+  } else {
+    boot();
+  }
+})();
+
+  </script>
+  <!-- ==== 全站同步层（云端在本仓库） ==== -->
+  <script>
+/* ==========================================================================
+   小小宇宙 · 全站同步层（GitHub 仓库当云端）
+   --------------------------------------------------------------------------
+   把 昵称/生日/纪念日/故事簿/吵架存档/心情/经期/秘密信/爱心 打包加密，
+   存到 secret-photos/state.bin。
+   改动后 3 秒自动提交；别的设备打开/轮询时拉下来覆盖，于是处处一致。
+   照片由 secret-gallery.js 负责，互不干扰（同一个暗号）。
+   ========================================================================== */
+(function () {
+  'use strict';
+
+  var CFG = {
+    owner: '2273873504-dotcom',
+    repo: 'our-little-universe',
+    branch: 'main',
+    headPath: 'secret-photos/head.json',
+    statePath: 'secret-photos/state.bin',
+    api: 'https://api.github.com'
+  };
+
+  var K_TOKEN = 'ulu-gh-token';
+  var K_PASS = 'ulu-photo-pass';
+
+  var key = null;
+  var saltB64 = '';
+  var iter = 210000;
+  var lastSig = '';        // 上次已知（本地=远端）的状态签名
+  var lastRemoteAt = 0;    // 远端状态的时间戳
+  var pushing = false;
+  var pulledAt = 0;
+  var badgeEl = null;
+
+  /* ---------------- 小工具 ---------------- */
+
+  function say(msg) {
+    if (typeof toast === 'function') { toast(msg); } else { console.log('[同步]', msg); }
+  }
+
+  function token() { try { return localStorage.getItem(K_TOKEN) || ''; } catch (e) { return ''; } }
+  function savedPass() { try { return localStorage.getItem(K_PASS) || ''; } catch (e) { return ''; } }
+
+  function b64ToBytes(s) {
+    var bin = atob(s), u8 = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) { u8[i] = bin.charCodeAt(i); }
+    return u8;
+  }
+
+  function bytesToB64(u8) {
+    var out = '', chunk = 0x8000;
+    for (var i = 0; i < u8.length; i += chunk) {
+      out += String.fromCharCode.apply(null, u8.subarray(i, i + chunk));
+    }
+    return btoa(out);
+  }
+
+  function deriveKey(pass, salt, it) {
+    return crypto.subtle.importKey('raw', new TextEncoder().encode(pass), 'PBKDF2', false, ['deriveKey'])
+      .then(function (base) {
+        return crypto.subtle.deriveKey(
+          { name: 'PBKDF2', salt: b64ToBytes(salt), iterations: it || iter, hash: 'SHA-256' },
+          base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']
+        );
+      });
+  }
+
+  function encrypt(u8) {
+    var iv = crypto.getRandomValues(new Uint8Array(12));
+    return crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, key, u8).then(function (ct) {
+      var buf = new Uint8Array(12 + ct.byteLength);
+      buf.set(iv, 0);
+      buf.set(new Uint8Array(ct), 12);
+      return buf;
+    });
+  }
+
+  function decrypt(u8) {
+    return crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: u8.subarray(0, 12) }, key, u8.subarray(12)
+    ).then(function (pt) { return new Uint8Array(pt); });
+  }
+
+  /* ---------------- 状态快照 ---------------- */
+
+  function snapshot() {
+    var d = (typeof data !== 'undefined' && data) ? data : {};
+    return {
+      v: 1,
+      updatedAt: Date.now(),
+      data: {
+        yourName: d.yourName || '',
+        herName: d.herName || '',
+        birthday: d.birthday || '',
+        anniversary: d.anniversary || '',
+        letter: d.letter || '',
+        hearts: d.hearts || 0,
+        moods: d.moods || {},
+        periodDays: d.periodDays || []
+      },
+      memories: (typeof memories !== 'undefined' && memories) ? memories : [],
+      fights: (typeof fights !== 'undefined' && fights) ? fights : []
+    };
+  }
+
+  function sigOf(snap) {
+    return JSON.stringify({
+      data: snap.data, memories: snap.memories, fights: snap.fights
+    });
+  }
+
+  function applyRemote(remote) {
+    if (!remote || !remote.data) { return false; }
+    try {
+      if (typeof data !== 'undefined' && data) {
+        var keepPin = data.pin;
+        Object.keys(remote.data).forEach(function (k) { data[k] = remote.data[k]; });
+        if (typeof keepPin === 'string') { data.pin = keepPin; }   // 暗号只留本机
+        try { localStorage.setItem('little-universe-v1', JSON.stringify(data)); } catch (e) {}
+      }
+      if (Array.isArray(remote.memories) && typeof memories !== 'undefined') {
+        memories = remote.memories;
+        try { localStorage.setItem('little-universe-memories-v1', JSON.stringify(memories)); } catch (e) {}
+      }
+      if (Array.isArray(remote.fights) && typeof fights !== 'undefined') {
+        fights = remote.fights;
+        try { localStorage.setItem('little-universe-fights-v1', JSON.stringify(fights)); } catch (e) {}
+      }
+      redraw(remote);
+      return true;
+    } catch (e) {
+      console.error('[同步] 应用失败', e);
+      return false;
     }
   }
 
-  /* ---------- 接管 ---------- */
+  function redraw(remote) {
+    try { if (typeof renderDates === 'function') { renderDates(); } } catch (e) {}
+    try { if (typeof renderNames === 'function') { renderNames(); } } catch (e) {}
+    try { if (typeof renderTimeline === 'function') { renderTimeline(); } } catch (e) {}
+    try { if (typeof renderFights === 'function') { renderFights(); } } catch (e) {}
+    try { if (typeof renderMood === 'function') { renderMood(); } } catch (e) {}
+    try { if (typeof renderHomeMood === 'function') { renderHomeMood(); } } catch (e) {}
+    try {
+      var el = document.querySelector('#letterText');
+      var typing = el && document.activeElement === el;
+      var onSecret = document.body.dataset.route === 'secret';
+      if (onSecret && !typing && typeof renderSecret === 'function') { renderSecret(); }
+    } catch (e) {}
+  }
 
-  window.renderGallery = render;
-  window.showPhoto = show;
-  window.uluPhotoDiag = function () {
-    return loadUploads().then(function (list) {
-      console.log('[相册诊断] IndexedDB 可用: ' + (!dbFailed && 'indexedDB' in window));
-      console.log('[相册诊断] 已存照片数: ' + list.length, list.map(function (u) { return { key: u.key, size: u.blob && u.blob.size }; }));
-      return list.length;
+  /* ---------------- GitHub 读写 ---------------- */
+
+  function ghHeaders() {
+    return {
+      'Authorization': 'Bearer ' + token(),
+      'Accept': 'application/vnd.github+json',
+      'Content-Type': 'application/json',
+      'X-GitHub-Api-Version': '2022-11-28'
+    };
+  }
+
+  function apiUrl(path) {
+    return CFG.api + '/repos/' + CFG.owner + '/' + CFG.repo + '/contents/' + path;
+  }
+
+  function apiGet(path) {
+    return fetch(apiUrl(path) + '?ref=' + CFG.branch + '&t=' + Date.now(),
+      { headers: ghHeaders(), cache: 'no-store' })
+      .then(function (r) {
+        if (r.status === 404) { return null; }
+        if (!r.ok) { throw new Error('读取失败 ' + r.status); }
+        return r.json();
+      })
+      .then(function (j) {
+        if (!j) { return null; }
+        return { sha: j.sha, bytes: b64ToBytes((j.content || '').replace(/\s/g, '')) };
+      });
+  }
+
+  function apiPut(path, bytes, message, sha) {
+    var body = { message: message, content: bytesToB64(bytes), branch: CFG.branch };
+    if (sha) { body.sha = sha; }
+    return fetch(apiUrl(path), { method: 'PUT', headers: ghHeaders(), body: JSON.stringify(body) })
+      .then(function (r) {
+        if (r.ok) { return true; }
+        if (r.status === 401 || r.status === 403) { throw new Error('钥匙失效或权限不够'); }
+        if (r.status === 409 || r.status === 422) { throw new Error('仓库刚被改过'); }
+        throw new Error('提交失败 ' + r.status);
+      });
+  }
+
+  function pageFetch(path) {
+    return fetch('./' + path + '?t=' + Date.now(), { cache: 'no-store' })
+      .then(function (r) { return r.ok ? r.arrayBuffer() : null; })
+      .catch(function () { return null; });
+  }
+
+  /* ---------------- 同步动作 ---------------- */
+
+  function ensureKey() {
+    if (key) { return Promise.resolve(true); }
+    var pass = savedPass();
+    if (!pass) { return Promise.resolve(false); }
+    // 有钥匙优先问 API（刚建好相册、网站还没部署时也能立刻拿到）
+    var loader = token()
+      ? apiGet(CFG.headPath).then(function (f) { return f ? f.bytes : null; })
+      : pageFetch(CFG.headPath).then(function (b) { return b ? new Uint8Array(b) : null; });
+    return loader.then(function (bytes) {
+      if (!bytes) { return false; }
+      var j = JSON.parse(new TextDecoder().decode(bytes));
+      if (!j || !j.salt) { return false; }
+      saltB64 = j.salt;
+      iter = j.iter || 210000;
+      return deriveKey(pass, saltB64, iter).then(function (k) { key = k; return true; });
+    }).catch(function () { return false; });
+  }
+
+  function pull() {
+    return ensureKey().then(function (ok) {
+      if (!ok) { return false; }
+      // 有钥匙走 API（最准），没有就走网站
+      var loader = token()
+        ? apiGet(CFG.statePath).then(function (f) { return f ? f.bytes : null; })
+        : pageFetch(CFG.statePath).then(function (b) { return b ? new Uint8Array(b) : null; });
+      return loader.then(function (bytes) {
+        if (!bytes) { return false; }
+        return decrypt(bytes).then(function (pt) {
+          var remote = JSON.parse(new TextDecoder().decode(pt));
+          if (!remote || !remote.updatedAt) { return false; }
+          if (remote.updatedAt <= lastRemoteAt) { return false; }
+          lastRemoteAt = remote.updatedAt;
+          applyRemote(remote);
+          lastSig = sigOf(snapshot());
+          pulledAt = Date.now();
+          return true;
+        }).catch(function () { return false; });
+      });
+    }).catch(function () { return false; });
+  }
+
+  function push(snap) {
+    if (pushing || !token()) { return Promise.resolve(false); }
+    return ensureKey().then(function (ok) {
+      if (!ok) { return false; }
+      pushing = true;
+      setBadge('同步中…');
+      var json = new TextEncoder().encode(JSON.stringify(snap));
+      return encrypt(json).then(function (enc) {
+        return apiGet(CFG.statePath).then(function (f) {
+          return apiPut(CFG.statePath, enc, '同步 · ' + new Date().toLocaleString('zh-CN'), f ? f.sha : null);
+        });
+      }).then(function () {
+        pushing = false;
+        lastSig = sigOf(snap);
+        lastRemoteAt = snap.updatedAt;
+        setBadge('已同步');
+        return true;
+      }).catch(function (e) {
+        pushing = false;
+        setBadge('同步失败');
+        console.error('[同步]', e);
+        return false;
+      });
     });
-  };
+  }
 
-  migrateLegacy().then(function (moved) {
-    if (moved) { console.log('[相册] 从旧版搬过来 ' + moved + ' 张照片'); }
-    return render();
-  }).catch(function () { render(); });
+  /* ---------------- 角标 ---------------- */
 
-  // 原版页面自己的渲染是异步的，可能比这里稍微晚一点点结束。
-  // 稍后再刷一次，保证最终画面以这份为准（幂等，重复执行无害）。
-  function settle(ms) { setTimeout(function () { render(); }, ms); }
-  if (document.readyState === 'complete') { settle(400); settle(1500); }
-  else { window.addEventListener('load', function () { settle(400); settle(1500); }); }
+  function setBadge(text, tip) {
+    if (!badgeEl) {
+      badgeEl = document.createElement('button');
+      badgeEl.type = 'button';
+      badgeEl.style.cssText = 'position:fixed;left:14px;bottom:14px;z-index:45;padding:7px 12px;border-radius:99px;' +
+        'border:1px solid #ead9df;background:rgba(255,255,255,.9);color:#9a7180;font-size:10px;font-weight:800;' +
+        'cursor:pointer;box-shadow:0 4px 12px rgba(120,70,90,.12);backdrop-filter:blur(6px)';
+      badgeEl.onclick = function () { manual(); };
+      document.body.appendChild(badgeEl);
+    }
+    badgeEl.textContent = '☁ ' + text;
+    badgeEl.title = tip || '点击手动同步';
+  }
+
+  function manual() {
+    if (!savedPass()) {
+      var p = window.prompt('输入你们相册的暗号（用来解密同步数据）：');
+      if (!p) { return; }
+      try { localStorage.setItem(K_PASS, p.trim()); } catch (e) {}
+      key = null;
+    }
+    setBadge('同步中…');
+    pull().then(function (got) {
+      if (got) { say('已拉取最新内容　♡'); }
+      else { say('拉取完成（可能没有更新）'); }
+      setBadge(token() ? '已同步' : '只读');
+    });
+  }
+
+  /* ---------------- 定时器 ---------------- */
+
+  function tick() {
+    if (!key && savedPass()) {
+      ensureKey().then(function (ok) {
+        if (!ok) { setBadge('待同步'); return; }
+        pull().then(function () {
+          lastSig = sigOf(snapshot());
+          setBadge(token() ? '已同步' : '只读');
+        });
+      });
+      return;
+    }
+    if (!key) { setBadge('点这里开同步'); return; }
+
+    var snap = snapshot();
+    var sig = sigOf(snap);
+    if (sig !== lastSig) {
+      if (token()) {
+        // 等一下，别每敲一个字就提交
+        clearTimeout(tick.t);
+        tick.t = setTimeout(function () { push(snapshot()); }, 2500);
+        setBadge('待同步…');
+      } else {
+        lastSig = sig;              // 只读设备：本地改动不上传
+        setBadge('只读');
+      }
+    } else if (Date.now() - pulledAt > 60000) {
+      pull();                        // 偶尔拉一次，别人改了这边也能变
+    }
+  }
+
+  function boot() {
+    setInterval(tick, 3000);
+    setTimeout(tick, 800);
+    setBadge(savedPass() ? '准备同步' : '点这里开同步', '点一下用暗号开启同步');
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', boot);
+  } else {
+    boot();
+  }
+
+  window.__uluSync = { pull: pull, push: push, snapshot: snapshot, state: function () { return { key: key, lastSig: lastSig, lastRemoteAt: lastRemoteAt }; } };
 })();
+
   </script>
 </body>
 </html>

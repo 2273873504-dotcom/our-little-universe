@@ -233,5 +233,440 @@
     function showLetter(){const root=document.querySelector('#secretContent');root.innerHTML='<div class="secret-letter"><span class="pill">OPEN WHEN YOU MISS ME</span><h2>这封信，只给你们看。</h2><p>写下来以后，记得点“收好”。它只会留在当前设备的浏览器中。</p><textarea id="letterText" maxlength="3000" aria-label="我们的秘密信笺"></textarea><div class="secret-actions"><button class="button soft small" id="lockLetter">锁好信箱</button><button class="button small" id="saveLetter">收好这封信　♡</button></div><p class="tiny">暗号只是避免随手点开，不是加密保护。</p></div>';root.querySelector('#letterText').value=data.letter;root.querySelector('#saveLetter').onclick=()=>{data.letter=root.querySelector('#letterText').value;persist();toast('信收好啦　♡')};root.querySelector('#lockLetter').onclick=()=>{renderSecret();toast('信箱锁好啦。')}}
     selectedMood=data.moods[selectedMoodDate]||'';selectedPeriod=(data.periodDays||[]).includes(selectedMoodDate);ensureDailyGame();route();renderDates();renderNames();renderTimeline();renderGallery();renderMood();renderHomeMood();renderFights();updateClock();setInterval(renderDates,60000);setInterval(updateClock,1000);setInterval(()=>{if(gameDateKey&&gameDateKey!==keyForDate(new Date()))ensureDailyGame()},60000);
   </script>
+
+  <!-- ==== 照片墙升级补丁（自动插入） ==== -->
+  <script>
+(function () {
+  'use strict';
+
+  var CONFIG = {
+    syncHome: true,      // 首页拼贴是否跟随相册（不想改首页就设成 false）
+    maxEdge: 1600,       // 压缩后长边像素
+    quality: 0.86,       // JPEG 质量
+    maxFiles: 60         // 最多存多少张
+  };
+
+  var DB_NAME = 'little-universe-photos-v2';
+  var STORE = 'uploads';
+  var LEGACY_DB = 'little-universe-photos';
+
+  var FALLBACK_FILES = ['photo-01.jpg', 'photo-02.jpg', 'photo-03.jpg', 'photo-04.jpg', 'photo-05.jpg'];
+  var FALLBACK_TITLES = ['阳光落在她脸上的时候', '她和一杯热热的东西', '小小的鬼脸收藏', '那个很快乐的晚上', '最喜欢的一个眼神'];
+
+  var photos = [];        // {src, caption, key}
+  var objectUrls = [];    // 需要在下次渲染前回收
+  var db = null;
+  var dbFailed = false;
+  var memoryOnly = [];    // IndexedDB 不可用时的临时存放（刷新就没了）
+
+  // 保险：先记住原版相册函数，补丁万一出错就退回它，页面不会变成空白
+  var originalRender = (typeof renderGallery === 'function') ? renderGallery : window.renderGallery;
+  var fellBack = false;
+
+  /* ---------- 小工具 ---------- */
+
+  function say(msg) {
+    if (typeof toast === 'function') { toast(msg); } else { console.log('[相册]', msg); }
+  }
+
+  function defaultPhotos() {
+    var files = (typeof photoFiles !== 'undefined' && photoFiles && photoFiles.length) ? photoFiles : FALLBACK_FILES;
+    var titles = (typeof PHOTO_TITLES !== 'undefined' && PHOTO_TITLES && PHOTO_TITLES.length) ? PHOTO_TITLES : FALLBACK_TITLES;
+    return files.map(function (f, i) {
+      return { src: './assets/' + f, caption: titles[i] || '她的照片', key: null };
+    });
+  }
+
+  function revokeUrls() {
+    objectUrls.forEach(function (u) { try { URL.revokeObjectURL(u); } catch (e) {} });
+    objectUrls = [];
+  }
+
+  /* ---------- 数据库 ---------- */
+
+  function openDb() {
+    if (db) { return Promise.resolve(db); }
+    if (dbFailed || !('indexedDB' in window)) { return Promise.resolve(null); }
+    return new Promise(function (resolve) {
+      var req;
+      try {
+        req = indexedDB.open(DB_NAME, 1);
+      } catch (e) {
+        dbFailed = true;
+        return resolve(null);
+      }
+      req.onupgradeneeded = function () {
+        var d = req.result;
+        if (!d.objectStoreNames.contains(STORE)) { d.createObjectStore(STORE); }
+      };
+      req.onsuccess = function () { db = req.result; resolve(db); };
+      req.onerror = function () {
+        dbFailed = true;
+        resolve(null);
+      };
+      req.onblocked = function () { resolve(null); };
+    });
+  }
+
+  // 读出全部上传（按加入时间从早到晚）
+  function loadUploads() {
+    return openDb().then(function (d) {
+      if (!d) { return memoryOnly.slice(); }
+      return new Promise(function (resolve) {
+        var out = [];
+        try {
+          var req = d.transaction(STORE, 'readonly').objectStore(STORE).openCursor();
+          req.onsuccess = function () {
+            var c = req.result;
+            if (c) {
+              if (c.value && c.value.blob) {
+                out.push({ key: c.key, addedAt: c.value.addedAt || 0, blob: c.value.blob });
+              }
+              c.continue();
+            } else {
+              out.sort(function (a, b) { return a.addedAt - b.addedAt; });
+              resolve(out);
+            }
+          };
+          req.onerror = function () { resolve(out); };
+        } catch (e) {
+          resolve(out);
+        }
+      });
+    });
+  }
+
+  // 写入并回读验证：成功 true，失败 false（不再静默）
+  function saveUpload(blob, addedAt) {
+    if (dbFailed) { return Promise.resolve(false); }
+    return openDb().then(function (d) {
+      if (!d) {
+        memoryOnly.push({ key: 'mem' + addedAt, addedAt: addedAt, blob: blob });
+        return true;
+      }
+      var key = 'p' + addedAt + '-' + Math.random().toString(36).slice(2, 7);
+      return new Promise(function (resolve) {
+        var ok = false;
+        var tx;
+        try {
+          tx = d.transaction(STORE, 'readwrite');
+          tx.objectStore(STORE).put({ blob: blob, addedAt: addedAt }, key);
+        } catch (e) {
+          if (e && e.name === 'QuotaExceededError') { say('浏览器本地空间满了，先删几张再试～'); }
+          return resolve(false);
+        }
+        tx.oncomplete = function () {
+          // 回读一次，确认真的写进去了
+          var check = d.transaction(STORE, 'readonly').objectStore(STORE).get(key);
+          check.onsuccess = function () { resolve(!!check.result); };
+          check.onerror = function () { resolve(false); };
+        };
+        tx.onerror = function (e) {
+          var name = (e && e.target && e.target.error && e.target.error.name) || '';
+          if (name === 'QuotaExceededError') { say('浏览器本地空间满了，先删几张再试～'); }
+          resolve(false);
+        };
+        tx.onabort = function () { resolve(false); };
+      });
+    });
+  }
+
+  function deleteUpload(key) {
+    if (!key) { return Promise.resolve(); }
+    if (key.indexOf('mem') === 0) {
+      memoryOnly = memoryOnly.filter(function (r) { return r.key !== key; });
+      return Promise.resolve();
+    }
+    return openDb().then(function (d) {
+      if (!d) { return; }
+      return new Promise(function (resolve) {
+        var tx = d.transaction(STORE, 'readwrite');
+        tx.objectStore(STORE).delete(key);
+        tx.oncomplete = resolve;
+        tx.onerror = resolve;
+      });
+    });
+  }
+
+  /* ---------- 把旧版 extra0..extra4 搬过来 ---------- */
+
+  function migrateLegacy() {
+    if (!('indexedDB' in window) || !indexedDB.databases) { return Promise.resolve(0); }
+    return indexedDB.databases().then(function (list) {
+      var exists = list.some(function (d) { return d.name === LEGACY_DB; });
+      if (!exists) { return 0; }
+      return new Promise(function (resolve) {
+        var req = indexedDB.open(LEGACY_DB, 1);
+        req.onupgradeneeded = function () {};
+        req.onerror = function () { resolve(0); };
+        req.onsuccess = function () {
+          var oldDb = req.result;
+          if (!oldDb.objectStoreNames.contains('photos')) { oldDb.close(); return resolve(0); }
+          var keys = ['extra0', 'extra1', 'extra2', 'extra3', 'extra4'];
+          var moved = 0;
+          var chain = Promise.resolve();
+          keys.forEach(function (k) {
+            chain = chain.then(function () {
+              return new Promise(function (res) {
+                var g = oldDb.transaction('photos', 'readonly').objectStore('photos').get(k);
+                g.onsuccess = function () {
+                  var val = g.result;
+                  if (!val) { return res(); }
+                  res(saveUpload(val, Date.now()).then(function (ok) { if (ok) { moved++; } }));
+                };
+                g.onerror = function () { res(); };
+              });
+            });
+          });
+          chain.then(function () { oldDb.close(); resolve(moved); });
+        };
+      });
+    });
+  }
+
+  /* ---------- 图片处理 ---------- */
+
+  // 统一转成压缩后的 JPEG；认不出的格式直接抛错（好给用户一句人话）
+  function toJpegBlob(file) {
+    var draw = function (bitmap) {
+      var w = bitmap.width, h = bitmap.height;
+      var scale = Math.min(1, CONFIG.maxEdge / Math.max(w, h));
+      var cw = Math.max(1, Math.round(w * scale));
+      var ch = Math.max(1, Math.round(h * scale));
+      var canvas = document.createElement('canvas');
+      canvas.width = cw;
+      canvas.height = ch;
+      var ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, cw, ch);
+      ctx.drawImage(bitmap, 0, 0, cw, ch);
+      if (bitmap.close) { bitmap.close(); }
+      return new Promise(function (res, rej) {
+        canvas.toBlob(function (b) { b ? res(b) : rej(new Error('canvas 导出失败')); }, 'image/jpeg', CONFIG.quality);
+      });
+    };
+
+    if (window.createImageBitmap) {
+      return createImageBitmap(file, { imageOrientation: 'from-image' }).then(draw, function () {
+        return createImageBitmap(file).then(draw);
+      });
+    }
+    // 老浏览器兜底
+    return new Promise(function (res, rej) {
+      var url = URL.createObjectURL(file);
+      var img = new Image();
+      img.onload = function () {
+        var canvas = document.createElement('canvas');
+        var scale = Math.min(1, CONFIG.maxEdge / Math.max(img.naturalWidth, img.naturalHeight));
+        canvas.width = Math.round(img.naturalWidth * scale);
+        canvas.height = Math.round(img.naturalHeight * scale);
+        canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+        canvas.toBlob(function (b) { URL.revokeObjectURL(url); b ? res(b) : rej(new Error('canvas 导出失败')); }, 'image/jpeg', CONFIG.quality);
+      };
+      img.onerror = function () { URL.revokeObjectURL(url); rej(new Error('浏览器打不开这个图片格式')); };
+      img.src = url;
+    });
+  }
+
+  /* ---------- 渲染 ---------- */
+
+  function ensureStyle() {
+    if (document.getElementById('uluGalleryStyle')) { return; }
+    var s = document.createElement('style');
+    s.id = 'uluGalleryStyle';
+    s.textContent = [
+      '.ulu-del{position:absolute;right:-9px;top:-9px;width:26px;height:26px;border-radius:50%;border:2px solid #fff;',
+      'background:#e88a9b;color:#fff;font-size:13px;line-height:1;cursor:pointer;box-shadow:0 3px 8px rgba(120,70,90,.28);z-index:3}',
+      '.gallery-tile{overflow:visible}',
+      '.ulu-status{margin:26px 0 0;padding:10px 14px;border:1px dashed #e8cbd3;border-radius:14px;background:rgba(255,255,255,.6);',
+      'color:#a4808f;font-size:11px;text-align:center}',
+      '.ulu-status b{color:#d4748a}'
+    ].join('');
+    document.head.appendChild(s);
+  }
+
+  function tile(item, index, badge) {
+    var fig = document.createElement('figure');
+    fig.className = 'gallery-tile';
+    var img = document.createElement('img');
+    img.src = item.src;
+    img.alt = item.caption || '她的照片';
+    img.loading = 'lazy';
+    var cap = document.createElement('figcaption');
+    cap.textContent = item.caption || '她的照片';
+    fig.appendChild(img);
+    fig.appendChild(cap);
+    if (item.key) {
+      var del = document.createElement('button');
+      del.className = 'ulu-del';
+      del.type = 'button';
+      del.textContent = '×';
+      del.title = '删掉这张（只删本机）';
+      del.onclick = function (ev) {
+        ev.stopPropagation();
+        if (!window.confirm('这张照片会从这台设备上删掉，确定吗？')) { return; }
+        deleteUpload(item.key).then(function () { return render(); });
+      };
+      fig.appendChild(del);
+    }
+    fig.onclick = function () { show(index); };
+    if (badge) {
+      var tag = document.createElement('span');
+      tag.className = 'pill';
+      tag.style.cssText = 'position:absolute;left:8px;bottom:8px;background:#fff5f6;font-size:9px';
+      tag.textContent = badge;
+      fig.appendChild(tag);
+    }
+    return fig;
+  }
+
+  function renderCore() {
+    ensureStyle();
+    var grid = document.querySelector('#galleryGrid');
+    if (!grid) { return Promise.resolve(); }
+
+    return loadUploads().then(function (uploads) {
+      revokeUrls();
+      photos = defaultPhotos();
+      uploads.forEach(function (u) {
+        var url = URL.createObjectURL(u.blob);
+        objectUrls.push(url);
+        photos.push({ src: url, caption: '新放进来的回忆', key: u.key });
+      });
+      if (photos.length > CONFIG.maxFiles + 5) {
+        say('相册里的照片有点多啦，删掉几张老的再放新的吧～');
+      }
+
+      grid.innerHTML = '';
+      photos.forEach(function (item, i) { grid.appendChild(tile(item, i, null)); });
+
+      // 上传入口
+      var upload = document.createElement('label');
+      upload.className = 'upload-tile';
+      upload.innerHTML = '<b>＋</b><span>放进一张新的回忆</span><small>可以一次选多张 · 存在本机</small>' +
+                         '<input type="file" accept="image/*" multiple>';
+      upload.querySelector('input').onchange = function (e) {
+        handleFiles(e.target.files);
+      };
+      grid.appendChild(upload);
+
+      // 状态行
+      var status = document.querySelector('.ulu-status');
+      if (!status) {
+        status = document.createElement('div');
+        status.className = 'ulu-status';
+        grid.parentNode.insertBefore(status, grid.nextSibling);
+      }
+      var mine = photos.filter(function (p) { return p.key; }).length;
+      if (dbFailed) {
+        status.innerHTML = '<b>这台浏览器不允许本地保存</b>，现在加的照片刷新就没了（无痕模式、部分 App 内置浏览器会这样）。换成 Chrome / Safari 正常窗口打开再试。';
+      } else {
+        status.innerHTML = '这里共 <b>' + photos.length + '</b> 张，其中你自己放进来的是 <b>' + mine + '</b> 张。' +
+                           '上传的照片只保存在<b>这台设备的这个浏览器</b>里，不会同步给别人，也不会丢到网上去。';
+      }
+
+      if (CONFIG.syncHome) { syncHome(); }
+    });
+  }
+
+  // 统一入口：任何意外都在这里兜住
+  function render() {
+    return Promise.resolve().then(renderCore).catch(function (err) {
+      console.error('[相册补丁]', err);
+      if (!fellBack && typeof originalRender === 'function') {
+        fellBack = true;
+        try { originalRender(); } catch (e) {}
+        say('相册补丁出了点问题，已经退回原版显示');
+      }
+    });
+  }
+
+  function handleFiles(fileList) {
+    var files = Array.prototype.slice.call(fileList || []);
+    if (!files.length) { return; }
+    var done = 0, failed = [];
+
+    // 一张一张串行处理，避免手机内存爆掉
+    var chain = Promise.resolve();
+    files.forEach(function (f) {
+      chain = chain.then(function () {
+        if (!/^image\//.test(f.type) && !/\.(jpe?g|png|webp|gif|bmp|avif|heic)$/i.test(f.name)) {
+          failed.push(f.name + '（不是图片）');
+          return;
+        }
+        return toJpegBlob(f).then(function (blob) {
+          return saveUpload(blob, Date.now()).then(function (ok) {
+            if (ok) { done++; } else { failed.push(f.name + '（写入失败）'); }
+          });
+        }, function (err) {
+          failed.push(f.name + '（' + (err && err.message === '浏览器打不开这个图片格式'
+            ? '格式打不开，可能是 iPhone 的 HEIC，先导出成 JPG'
+            : (err && err.message) || '处理失败') + '）');
+        });
+      });
+    });
+
+    return chain.then(function () {
+      return render();
+    }).then(function () {
+      if (done && !failed.length) { say('加进去啦，' + done + ' 张　♡'); }
+      else if (done && failed.length) { say('成功 ' + done + ' 张，' + failed.length + ' 张没成功：' + failed[0]); }
+      else if (failed.length) { say('没能加进去：' + failed[0]); }
+    });
+  }
+
+  /* ---------- 放大预览 ---------- */
+
+  function show(index) {
+    if (!photos.length) { return; }
+    var n = photos.length;
+    activePhoto = ((index % n) + n) % n;
+    var item = photos[activePhoto];
+    document.querySelector('#viewerImage').src = item.src;
+    document.querySelector('#viewerCaption').textContent = item.caption || '她的照片';
+    // 原版弹窗
+    if (typeof openModal === 'function') { openModal('viewerModal'); }
+    else { document.querySelector('#viewerModal').classList.add('open'); }
+  }
+
+  /* ---------- 首页拼贴跟随 ---------- */
+
+  function syncHome() {
+    var pool = photos.slice().reverse();   // 新的优先
+    if (!pool.length) { return; }
+    var stage = document.querySelectorAll('.photo-stage .photo-card img');
+    for (var i = 0; i < stage.length; i++) {
+      stage[i].src = pool[i % pool.length].src;
+    }
+    var atmo = document.querySelectorAll('.photo-atmosphere img');
+    for (var j = 0; j < atmo.length; j++) {
+      atmo[j].src = pool[j % pool.length].src;
+    }
+  }
+
+  /* ---------- 接管 ---------- */
+
+  window.renderGallery = render;
+  window.showPhoto = show;
+  window.uluPhotoDiag = function () {
+    return loadUploads().then(function (list) {
+      console.log('[相册诊断] IndexedDB 可用: ' + (!dbFailed && 'indexedDB' in window));
+      console.log('[相册诊断] 已存照片数: ' + list.length, list.map(function (u) { return { key: u.key, size: u.blob && u.blob.size }; }));
+      return list.length;
+    });
+  };
+
+  migrateLegacy().then(function (moved) {
+    if (moved) { console.log('[相册] 从旧版搬过来 ' + moved + ' 张照片'); }
+    return render();
+  }).catch(function () { render(); });
+
+  // 原版页面自己的渲染是异步的，可能比这里稍微晚一点点结束。
+  // 稍后再刷一次，保证最终画面以这份为准（幂等，重复执行无害）。
+  function settle(ms) { setTimeout(function () { render(); }, ms); }
+  if (document.readyState === 'complete') { settle(400); settle(1500); }
+  else { window.addEventListener('load', function () { settle(400); settle(1500); }); }
+})();
+  </script>
 </body>
 </html>
